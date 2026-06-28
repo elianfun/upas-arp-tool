@@ -18,6 +18,7 @@ app = Flask(__name__)
 
 # ── State ─────────────────────────────────────────────────────────────────────
 _scan_results: list[dict] = []
+_scan_version  = 0          # incremented after every scan; watcher uses this to detect new scan
 _enforce_status = "idle"   # idle | running | stopping
 _enforce_stop = threading.Event()
 _enforce_thread = None
@@ -71,7 +72,7 @@ def index():
 
 @app.route("/api/scan", methods=["POST"])
 def api_scan():
-    global _scan_results
+    global _scan_results, _scan_version
     data = request.get_json(silent=True) or {}
     interface = data.get("interface", "ens18")
     subnet = data.get("subnet", "192.168.88.0/24")
@@ -81,6 +82,7 @@ def api_scan():
         for d in devices:
             d["whitelisted"] = d["mac"].upper() in wl
         _scan_results = devices
+        _scan_version += 1   # signal watcher to re-sync targets
         return jsonify({"ok": True, "devices": devices})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -202,9 +204,50 @@ def api_enf_start():
                 sendp(counter, iface=interface, verbose=False)
                 _log(f"[COUNTER] Gratuitous ARP from {src_ip} → broadcast overwrite")
 
+    def _sync_targets(reason: str):
+        """Diff _scan_results against whitelist; add/remove targets in place."""
+        new_wl_macs = {e["mac"].upper() for e in load_whitelist()}
+        with state_lock:
+            current     = list(targets_list)
+            current_ips = set(target_ips)
+
+        promoted = [t for t in current if t["mac"].upper() in new_wl_macs]
+        demoted  = [d for d in _scan_results
+                    if d["mac"].upper() not in new_wl_macs and d["ip"] not in current_ips]
+
+        if not promoted and not demoted:
+            return
+
+        for t in promoted:
+            restore(gateway_ip, gw_mac, t["ip"], t["mac"], interface)
+            restore(t["ip"], t["mac"], gateway_ip, gw_mac, interface)
+            with watched_lock:
+                snap = {ip: d["mac"] for ip, d in watched_peers.items()}
+            for peer_ip, peer_mac in snap.items():
+                restore(peer_ip, peer_mac, t["ip"], t["mac"], interface)
+            _log(f"[{reason}] {t['ip']} whitelisted → removed from targets, ARP restored")
+
+        with state_lock:
+            for t in promoted:
+                if t in targets_list: targets_list.remove(t)
+                target_ips.discard(t["ip"])
+                target_by_ip.pop(t["ip"], None)
+                target_last_seen.pop(t["ip"], None)
+                target_online.pop(t["ip"], None)
+            for d in demoted:
+                targets_list.append(d)
+                target_ips.add(d["ip"])
+                target_by_ip[d["ip"]] = d
+                target_last_seen[d["ip"]] = _time.time()
+                target_online[d["ip"]] = True
+
+        for d in demoted:
+            _log(f"[{reason}] {d['ip']} ({d['mac']}) → added to targets")
+
     def _watch_whitelist():
-        """Re-read whitelist.json every 3 s; hot-add/remove targets without restart."""
-        last_mtime = _os.path.getmtime(WHITELIST_FILE) if _os.path.exists(WHITELIST_FILE) else 0
+        """Re-sync when whitelist.json changes OR a new scan completes (every 3 s poll)."""
+        last_mtime    = _os.path.getmtime(WHITELIST_FILE) if _os.path.exists(WHITELIST_FILE) else 0
+        last_scan_ver = _scan_version
         while not _enforce_stop.is_set():
             _enforce_stop.wait(3)
             if _enforce_stop.is_set():
@@ -212,48 +255,19 @@ def api_enf_start():
             try:
                 curr_mtime = _os.path.getmtime(WHITELIST_FILE) if _os.path.exists(WHITELIST_FILE) else 0
             except OSError:
-                continue
-            if curr_mtime == last_mtime:
-                continue
-            last_mtime = curr_mtime
+                curr_mtime = last_mtime
 
-            new_wl_macs = {e["mac"].upper() for e in load_whitelist()}
+            wl_changed   = curr_mtime != last_mtime
+            scan_changed = _scan_version != last_scan_ver
 
-            with state_lock:
-                current = list(targets_list)
-                current_ips = set(target_ips)
+            if wl_changed:
+                last_mtime = curr_mtime
+                _sync_targets("WHITELIST")
+            elif scan_changed:
+                _sync_targets("SCAN")
 
-            # Devices now whitelisted → remove from targets, restore ARP
-            promoted = [t for t in current if t["mac"].upper() in new_wl_macs]
-            # Devices no longer whitelisted → add as new targets
-            demoted  = [d for d in _scan_results
-                        if d["mac"].upper() not in new_wl_macs and d["ip"] not in current_ips]
-
-            for t in promoted:
-                restore(gateway_ip, gw_mac, t["ip"], t["mac"], interface)
-                restore(t["ip"], t["mac"], gateway_ip, gw_mac, interface)
-                with watched_lock:
-                    snap = {ip: d["mac"] for ip, d in watched_peers.items()}
-                for peer_ip, peer_mac in snap.items():
-                    restore(peer_ip, peer_mac, t["ip"], t["mac"], interface)
-                _log(f"[WHITELIST] {t['ip']} whitelisted → removed from targets, ARP restored")
-
-            with state_lock:
-                for t in promoted:
-                    if t in targets_list: targets_list.remove(t)
-                    target_ips.discard(t["ip"])
-                    target_by_ip.pop(t["ip"], None)
-                    target_last_seen.pop(t["ip"], None)
-                    target_online.pop(t["ip"], None)
-                for d in demoted:
-                    targets_list.append(d)
-                    target_ips.add(d["ip"])
-                    target_by_ip[d["ip"]] = d
-                    target_last_seen[d["ip"]] = _time.time()
-                    target_online[d["ip"]] = True
-
-            for d in demoted:
-                _log(f"[WHITELIST] {d['ip']} removed from whitelist → added to targets")
+            if scan_changed:
+                last_scan_ver = _scan_version
 
     from scapy.all import AsyncSniffer
     sniffer = AsyncSniffer(iface=interface, filter="arp", prn=_handle_arp, store=False)
