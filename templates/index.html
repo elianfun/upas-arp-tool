@@ -129,7 +129,20 @@ body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', syste
                 <span id="scanLabel">開始掃描</span>
               </button>
             </div>
-            <div class="mt-3 small" style="color:var(--muted)" id="scanSummary"></div>
+            <div class="mt-2 small" style="color:var(--muted)" id="scanSummary"></div>
+            <hr style="border-color:var(--border);margin:.75rem 0">
+            <label class="form-label">自動掃描間隔（秒）</label>
+            <input class="form-control form-control-sm mb-2" id="autoInterval" type="number" value="60" min="10">
+            <div class="d-grid gap-1">
+              <button class="btn btn-sm" id="btnAutoStart"
+                style="color:var(--blue);border:1px solid var(--blue)">
+                <i class="bi bi-arrow-repeat me-1"></i>開啟自動掃描
+              </button>
+              <button class="btn btn-sm" id="btnAutoStop" style="display:none;color:var(--amber);border:1px solid var(--amber)">
+                <i class="bi bi-stop-circle me-1"></i>停止自動掃描
+              </button>
+            </div>
+            <div class="mt-2 small" id="autoStatus" style="color:var(--muted)"></div>
           </div>
         </div>
       </div>
@@ -501,15 +514,69 @@ document.getElementById('btnClear').addEventListener('click', () => {
   document.getElementById('logArea').innerHTML = '';
 });
 
+// ── Auto-scan ─────────────────────────────────────────────────────────────────
+let lastScanVersion = 0;
+
+document.getElementById('btnAutoStart').addEventListener('click', async () => {
+  const interval = parseInt(document.getElementById('autoInterval').value) || 60;
+  const res = await fetch('/api/autoscan/start', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({
+      interface: document.getElementById('iface').value.trim(),
+      subnet:    document.getElementById('subnet').value.trim(),
+      interval
+    })
+  });
+  const data = await res.json();
+  if (!data.ok) { alert('啟動失敗: ' + data.error); return; }
+  setAutoScanUI('running');
+});
+
+document.getElementById('btnAutoStop').addEventListener('click', async () => {
+  await fetch('/api/autoscan/stop', { method: 'POST' });
+  setAutoScanUI('idle');
+});
+
+function setAutoScanUI(status) {
+  document.getElementById('btnAutoStart').style.display = status === 'running' ? 'none' : '';
+  document.getElementById('btnAutoStop').style.display  = status === 'running' ? '' : 'none';
+}
+
+async function pollAutoScan() {
+  try {
+    const res  = await fetch('/api/autoscan/status');
+    const data = await res.json();
+    setAutoScanUI(data.status);
+    const el = document.getElementById('autoStatus');
+    if (data.status === 'running') {
+      el.textContent = data.last ? `上次掃描：${data.last}` : '等待第一次掃描…';
+    } else {
+      el.textContent = data.last ? `已停止 | 最後掃描：${data.last}` : '';
+    }
+    // If scan_version changed, refresh device table and enforce status
+    if (data.version !== lastScanVersion) {
+      lastScanVersion = data.version;
+      const r2   = await fetch('/api/scan/results');
+      const scan = await r2.json();
+      scanDevices = scan.devices;
+      renderDevices(scanDevices);
+      document.getElementById('scanSummary').textContent = `發現 ${scan.devices.length} 台設備`;
+      refreshEnforceStatus();
+    }
+  } catch(_) {}
+}
+
 // ── Periodic refresh ────────────────────────────────────────────────────────
 setInterval(() => {
   if (enforceStatus === 'running' || enforceStatus === 'stopping') refreshEnforceStatus();
+  pollAutoScan();
 }, 4000);
 
 // ── Init ────────────────────────────────────────────────────────────────────
 connectLogStream();
 refreshEnforceStatus();
 loadWhitelist();
+pollAutoScan();
 </script>
 </body>
 </html>

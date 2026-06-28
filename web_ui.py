@@ -19,9 +19,16 @@ app = Flask(__name__)
 # ── State ─────────────────────────────────────────────────────────────────────
 _scan_results: list[dict] = []
 _scan_version  = 0          # incremented after every scan; watcher uses this to detect new scan
+_scan_lock     = threading.Lock()   # prevent concurrent scans
 _enforce_status = "idle"   # idle | running | stopping
 _enforce_stop = threading.Event()
 _enforce_thread = None
+
+# ── Auto-scan state ────────────────────────────────────────────────────────────
+_auto_scan_status   = "idle"   # idle | running
+_auto_scan_stop     = threading.Event()
+_auto_scan_thread   = None
+_auto_scan_last: str | None = None   # HH:MM:SS of last completed scan
 
 # ── Log pub/sub ───────────────────────────────────────────────────────────────
 _log_history: collections.deque = collections.deque(maxlen=500)
@@ -70,22 +77,94 @@ def index():
     return render_template("index.html")
 
 
-@app.route("/api/scan", methods=["POST"])
-def api_scan():
+def _do_scan(interface: str, subnet: str) -> list[dict]:
+    """Run ARP scan, update global _scan_results and bump _scan_version."""
     global _scan_results, _scan_version
-    data = request.get_json(silent=True) or {}
-    interface = data.get("interface", "ens18")
-    subnet = data.get("subnet", "192.168.88.0/24")
-    try:
+    with _scan_lock:
         devices = scan_network(subnet, interface)
         wl = {e["mac"].upper() for e in load_whitelist()}
         for d in devices:
             d["whitelisted"] = d["mac"].upper() in wl
         _scan_results = devices
-        _scan_version += 1   # signal watcher to re-sync targets
+        _scan_version += 1
+    return devices
+
+
+@app.route("/api/scan", methods=["POST"])
+def api_scan():
+    data = request.get_json(silent=True) or {}
+    interface = data.get("interface", "ens18")
+    subnet    = data.get("subnet",    "192.168.88.0/24")
+    try:
+        devices = _do_scan(interface, subnet)
         return jsonify({"ok": True, "devices": devices})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/scan/results")
+def api_scan_results():
+    """Lightweight poll — returns cached results without rescanning."""
+    wl = {e["mac"].upper() for e in load_whitelist()}
+    results = [{**d, "whitelisted": d["mac"].upper() in wl} for d in _scan_results]
+    return jsonify({"devices": results, "version": _scan_version})
+
+
+@app.route("/api/autoscan/start", methods=["POST"])
+def api_autoscan_start():
+    global _auto_scan_thread, _auto_scan_stop, _auto_scan_status
+    if _auto_scan_status == "running":
+        return jsonify({"ok": False, "error": "Already running"}), 400
+    data      = request.get_json(silent=True) or {}
+    interface = data.get("interface", "ens18")
+    subnet    = data.get("subnet",    "192.168.88.0/24")
+    interval  = max(int(data.get("interval", 60)), 10)
+
+    _auto_scan_stop   = threading.Event()
+    _auto_scan_status = "running"
+
+    def _worker():
+        global _auto_scan_status, _auto_scan_last
+        _log(f"[AUTO-SCAN] Started — {subnet} on {interface} every {interval}s")
+        while not _auto_scan_stop.is_set():
+            _auto_scan_stop.wait(interval)
+            if _auto_scan_stop.is_set():
+                break
+            try:
+                prev_ips = {d["ip"] for d in _scan_results}
+                devices  = _do_scan(interface, subnet)
+                now_ips  = {d["ip"] for d in devices}
+                new_ips  = now_ips - prev_ips
+                gone_ips = prev_ips - now_ips
+                _auto_scan_last = datetime.now().strftime("%H:%M:%S")
+                parts = [f"{len(devices)} devices"]
+                if new_ips:
+                    parts.append(f"+{len(new_ips)} joined: {', '.join(sorted(new_ips))}")
+                if gone_ips:
+                    parts.append(f"-{len(gone_ips)} left: {', '.join(sorted(gone_ips))}")
+                _log(f"[AUTO-SCAN] {' | '.join(parts)}")
+            except Exception as e:
+                _log(f"[AUTO-SCAN] Error: {e}")
+        _auto_scan_status = "idle"
+        _log("[AUTO-SCAN] Stopped")
+
+    _auto_scan_thread = threading.Thread(target=_worker, daemon=True, name="auto-scan")
+    _auto_scan_thread.start()
+    return jsonify({"ok": True, "interval": interval})
+
+
+@app.route("/api/autoscan/stop", methods=["POST"])
+def api_autoscan_stop():
+    global _auto_scan_status
+    if _auto_scan_status != "running":
+        return jsonify({"ok": False, "error": "Not running"}), 400
+    _auto_scan_stop.set()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/autoscan/status")
+def api_autoscan_status():
+    return jsonify({"status": _auto_scan_status, "last": _auto_scan_last, "version": _scan_version})
 
 
 @app.route("/api/whitelist", methods=["GET"])
